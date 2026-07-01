@@ -1,0 +1,144 @@
+# This file is licensed under the Apache License v2.0 with LLVM Exceptions.
+# See https://llvm.org/LICENSE.txt for license information.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+# Bazel port of libcxxabi (the C++ ABI runtime for libc++).
+#
+# Scope: standalone library. Consumers link `:cxxabi` alongside libcxx's
+# `:cxx`. libcxxabi provides __cxa_throw, typeinfo, vtables, demangling,
+# and the personality routine for unwind tables.
+#
+# Configuration (matches CMake defaults on a typical host):
+#   LIBCXXABI_ENABLE_EXCEPTIONS = ON  -> cxa_exception.cpp + cxa_personality.cpp
+#   LIBCXXABI_ENABLE_NEW_DELETE_DEFINITIONS = ON -> stdlib_new_delete.cpp
+#   LIBCXXABI_ENABLE_THREADS = ON
+#   LIBCXXABI_USE_LLVM_UNWINDER = ON (linkopts assume libunwind is provided)
+#
+# cxa_thread_atexit.cpp is built only on Linux/Fuchsia (CMake gates it on
+# UNIX && !APPLE && !AIX).
+#
+# Same compiler-support story as libcxx: Clang (any recent), AppleClang,
+# MSVC via clang-cl, GCC >= 15. No `target_compatible_with` gate because
+# Bazel can't query compiler version. Builds on unsupported toolchains
+# fail loudly at compile time.
+
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+package(
+    default_visibility = ["//visibility:public"],
+    features = ["layering_check"],
+)
+
+licenses(["notice"])
+
+# ---------------------------------------------------------------------------
+# Public headers
+# ---------------------------------------------------------------------------
+
+# Public ABI headers. Used by libcxx (which #includes <cxxabi.h> from
+# some of its src files) and by external consumers.
+cc_library(
+    name = "cxxabi_headers",
+    hdrs = [
+        "include/__cxxabi_config.h",
+        "include/cxxabi.h",
+    ],
+    includes = ["include"],
+)
+
+# ---------------------------------------------------------------------------
+# libc++abi
+# ---------------------------------------------------------------------------
+
+# Internal headers needed by the .cpp files. textual_hdrs because they're
+# not self-contained and are pulled in via specific configurations.
+_libcxxabi_internal_hdrs = [
+    "src/abort_message.h",
+    "src/cxa_exception.h",
+    "src/cxa_guard_impl.h",
+    "src/cxa_handlers.h",
+    "src/fallback_malloc.h",
+    "src/private_typeinfo.h",
+] + glob([
+    # Itanium demangler templates — these are textual headers used
+    # exclusively by cxa_demangle.cpp.
+    "src/demangle/*.h",
+    "src/demangle/*.def",
+])
+
+cc_library(
+    name = "cxxabi",
+    srcs = [
+        # Core C++ ABI files (always built)
+        "src/cxa_aux_runtime.cpp",
+        "src/cxa_default_handlers.cpp",
+        "src/cxa_demangle.cpp",
+        "src/cxa_exception_storage.cpp",
+        "src/cxa_guard.cpp",
+        "src/cxa_handlers.cpp",
+        "src/cxa_vector.cpp",
+        "src/cxa_virtual.cpp",
+        # C++ STL adapter files
+        "src/stdlib_exception.cpp",
+        "src/stdlib_stdexcept.cpp",
+        "src/stdlib_typeinfo.cpp",
+        # Internal
+        "src/abort_message.cpp",
+        "src/fallback_malloc.cpp",
+        "src/private_typeinfo.cpp",
+        # LIBCXXABI_ENABLE_NEW_DELETE_DEFINITIONS = ON
+        "src/stdlib_new_delete.cpp",
+        # LIBCXXABI_ENABLE_EXCEPTIONS = ON (the non-`else` branch)
+        "src/cxa_exception.cpp",
+        "src/cxa_personality.cpp",
+    ] + select({
+        # LIBCXXABI_ENABLE_THREADS && UNIX && !APPLE && !AIX
+        "@platforms//os:linux": ["src/cxa_thread_atexit.cpp"],
+        "//conditions:default": [],
+    }),
+    copts = [
+        "-D_LIBCXXABI_BUILDING_LIBRARY",
+        "-D_LIBCPP_BUILDING_LIBRARY",
+        "-D_LIBCPP_DISABLE_VISIBILITY_ANNOTATIONS",
+        # Same -nostdinc++ rationale as libcxx: ensure our libcxx headers
+        # win over the host toolchain's.
+        "-nostdinc++",
+        "-fvisibility=hidden",
+        "-fvisibility-inlines-hidden",
+        "-std=c++23",
+        "-fstrict-aliasing",
+        # Warning suppressions matching libcxxabi/CMakeLists.txt.
+        "-Wno-attributes",
+        "-Wno-vla",
+        "-Wno-deprecated",
+        # Exceptions enabled for the runtime itself (it implements them).
+        "-funwind-tables",
+    ] + select({
+        # Clang-only; GCC errors on it. See //libcxx:BUILD.bazel for
+        # rationale.
+        "@rules_cc//cc/compiler:clang": ["-fvisibility-global-new-delete=force-hidden"],
+        "@rules_cc//cc/compiler:clang-cl": ["-fvisibility-global-new-delete=force-hidden"],
+        "//conditions:default": [],
+    }),
+    linkopts = select({
+        # libunwind symbols (_Unwind_RaiseException et al.) need to be
+        # provided at link time. On most Linux distros, libgcc_s exports
+        # them; on macOS, libSystem does. Windows uses the system unwind
+        # info. We don't depend on //libunwind explicitly because that
+        # overlay only exposes headers, not a runtime library.
+        "@platforms//os:windows": [],
+        "//conditions:default": [
+            "-lpthread",
+            "-ldl",
+            "-lm",
+        ],
+    }),
+    textual_hdrs = _libcxxabi_internal_hdrs,
+    # libcxx ↔ libcxxabi cycle is resolved by both libraries depending only
+    # on the OTHER's headers target. Final consumers link both `:cxx` and
+    # `:cxxabi`.
+    deps = [
+        ":cxxabi_headers",
+        "//libcxx:cxx_headers",
+    ],
+)
