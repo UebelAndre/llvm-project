@@ -1,0 +1,355 @@
+# This file is licensed under the Apache License v2.0 with LLVM Exceptions.
+# See https://llvm.org/LICENSE.txt for license information.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+# Bazel port of libcxx (the LLVM C++ standard library).
+#
+# Scope: standalone library — consumers `deps = [":cxx", "//libcxxabi:cxxabi"]`
+# and link explicitly. No toolchain integration; this is not the Bazel C++
+# stdlib by default.
+#
+# Supported configurations: Linux, macOS, Windows on the host CPU.
+# Supported compilers (per libcxx/docs/index.rst): Clang (any recent),
+# AppleClang, MSVC via clang-cl, and GCC >= 15. GCC <= 14 lacks the
+# type-trait builtins (__decay, __add_lvalue_reference, __is_function,
+# ...) that libcxx headers require and will fail at the header level.
+# No `target_compatible_with` gate here because Bazel can't query the
+# compiler version directly; an over-strict Clang-only gate would reject
+# supported GCC 15+ builds. Builds on unsupported toolchains fail loudly
+# at compile time — same behavior as upstream CMake.
+#
+# Optional libcxx features are pinned ON: threads, localization,
+# random_device, filesystem, new/delete definitions, unicode, wide
+# characters. Time zone database is Linux-only. ASAN instrumentation is off.
+# Hardening defaults to "none". PSTL backend defaults to "serial".
+
+load("@bazel_skylib//rules:expand_template.bzl", "expand_template")
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+package(
+    default_visibility = ["//visibility:public"],
+    features = ["layering_check"],
+)
+
+licenses(["notice"])
+
+# Supported compilers (per libcxx/docs/index.rst): Clang (any recent),
+# AppleClang, MSVC via clang-cl, GCC >= 15. No `target_compatible_with`
+# gate here because Bazel can't query compiler version, and the
+# Clang-family-only gate I started with rejected supported GCC 15+ builds.
+# Builds on unsupported toolchains (GCC <= 14) will fail loudly at the
+# header level — same behavior as upstream CMake.
+
+# ---------------------------------------------------------------------------
+# Generated headers
+# ---------------------------------------------------------------------------
+
+# __config_site: feature macros driven by build options. Mirrors what
+# libcxx/include/CMakeLists.txt:
+#     configure_file("__config_site.in"
+#                    "${LIBCXX_GENERATED_INCLUDE_TARGET_DIR}/__config_site"
+#                    @ONLY)
+# would produce on a Linux/macOS/Windows host with default options.
+#
+# Substitutions follow the same pattern as the openmp port: a constant base
+# plus an OS-driven overlay assembled via `|` dict union. No CPU dimension
+# (libcxx has no architecture-specific code); the ABI/compiler dimension
+# only flips `_LIBCPP_NO_VCRUNTIME` and `_LIBCPP_ABI_FORCE_*`, which are
+# folded into the OS overlay since our supported Windows config is Clang-cl
+# (MSVC ABI). Adding native MSVC cl.exe would require splitting this.
+expand_template(
+    name = "config_site_gen",
+    out = "include/__config_site",
+    substitutions = {
+        # ABI versioning (matches CMake defaults).
+        "#cmakedefine _LIBCPP_ABI_VERSION @_LIBCPP_ABI_VERSION@": "#define _LIBCPP_ABI_VERSION 1",
+        # Default builds don't set _LIBCPP_ABI_NAMESPACE; leaving it undefined
+        # is equivalent to "#cmakedefine"-with-no-value, which produces a
+        # commented-out line. Substitute to a comment to keep cmakedefine
+        # markers from leaking into the header.
+        "#cmakedefine _LIBCPP_ABI_NAMESPACE @_LIBCPP_ABI_NAMESPACE@": "/* #undef _LIBCPP_ABI_NAMESPACE */",
+        # Same pattern for the few other plain `#cmakedefine` (no value).
+        "#cmakedefine _LIBCPP_DISABLE_VISIBILITY_ANNOTATIONS": "/* #undef _LIBCPP_DISABLE_VISIBILITY_ANNOTATIONS */",
+        "#cmakedefine _LIBCPP_TYPEINFO_COMPARISON_IMPLEMENTATION @_LIBCPP_TYPEINFO_COMPARISON_IMPLEMENTATION@": "/* #undef _LIBCPP_TYPEINFO_COMPARISON_IMPLEMENTATION */",
+        # PSTL backend: serial (the default; no extra deps).
+        "#cmakedefine _LIBCPP_PSTL_BACKEND_SERIAL": "#define _LIBCPP_PSTL_BACKEND_SERIAL",
+        "#cmakedefine _LIBCPP_PSTL_BACKEND_STD_THREAD": "/* #undef _LIBCPP_PSTL_BACKEND_STD_THREAD */",
+        "#cmakedefine _LIBCPP_PSTL_BACKEND_LIBDISPATCH": "/* #undef _LIBCPP_PSTL_BACKEND_LIBDISPATCH */",
+        # Hardening (matches CMake defaults: mode=none, assertion=hardening_dependent).
+        "#cmakedefine _LIBCPP_HARDENING_MODE_DEFAULT @_LIBCPP_HARDENING_MODE_DEFAULT@": "#define _LIBCPP_HARDENING_MODE_DEFAULT _LIBCPP_HARDENING_MODE_NONE",
+        "#cmakedefine _LIBCPP_ASSERTION_SEMANTIC_DEFAULT @_LIBCPP_ASSERTION_SEMANTIC_DEFAULT@": "#define _LIBCPP_ASSERTION_SEMANTIC_DEFAULT _LIBCPP_ASSERTION_SEMANTIC_OBSERVE_OR_IGNORE",
+        # Standard library features that are always on for our supported
+        # configurations.
+        "#cmakedefine01 _LIBCPP_HAS_THREADS": "#define _LIBCPP_HAS_THREADS 1",
+        "#cmakedefine01 _LIBCPP_HAS_MONOTONIC_CLOCK": "#define _LIBCPP_HAS_MONOTONIC_CLOCK 1",
+        "#cmakedefine01 _LIBCPP_HAS_FILESYSTEM": "#define _LIBCPP_HAS_FILESYSTEM 1",
+        "#cmakedefine01 _LIBCPP_HAS_RANDOM_DEVICE": "#define _LIBCPP_HAS_RANDOM_DEVICE 1",
+        "#cmakedefine01 _LIBCPP_HAS_LOCALIZATION": "#define _LIBCPP_HAS_LOCALIZATION 1",
+        "#cmakedefine01 _LIBCPP_HAS_UNICODE": "#define _LIBCPP_HAS_UNICODE 1",
+        "#cmakedefine01 _LIBCPP_HAS_WIDE_CHARACTERS": "#define _LIBCPP_HAS_WIDE_CHARACTERS 1",
+        # Always off for our supported configurations.
+        "#cmakedefine01 _LIBCPP_HAS_MUSL_LIBC": "#define _LIBCPP_HAS_MUSL_LIBC 0",
+        "#cmakedefine01 _LIBCPP_HAS_VENDOR_AVAILABILITY_ANNOTATIONS": "#define _LIBCPP_HAS_VENDOR_AVAILABILITY_ANNOTATIONS 0",
+        "#cmakedefine01 _LIBCPP_INSTRUMENTED_WITH_ASAN": "#define _LIBCPP_INSTRUMENTED_WITH_ASAN 0",
+        # Always off: PSTL non-serial backends and libc selection.
+        "#cmakedefine01 _LIBCPP_LIBC_PICOLIBC": "#define _LIBCPP_LIBC_PICOLIBC 0",
+        "#cmakedefine01 _LIBCPP_LIBC_NEWLIB": "#define _LIBCPP_LIBC_NEWLIB 0",
+        "#cmakedefine01 _LIBCPP_LIBC_LLVM_LIBC": "#define _LIBCPP_LIBC_LLVM_LIBC 0",
+        # ABI defines / extra site defines: empty for default builds.
+        "@_LIBCPP_ABI_DEFINES@": "",
+        "@_LIBCPP_EXTRA_SITE_DEFINES@": "",
+    } | select({
+        # OS-only: ABI flavor, thread API, time zone database, MSVC vcruntime.
+        "@platforms//os:linux": {
+            "#cmakedefine01 _LIBCPP_ABI_FORCE_ITANIUM": "#define _LIBCPP_ABI_FORCE_ITANIUM 0",
+            "#cmakedefine01 _LIBCPP_ABI_FORCE_MICROSOFT": "#define _LIBCPP_ABI_FORCE_MICROSOFT 0",
+            "#cmakedefine01 _LIBCPP_HAS_THREAD_API_PTHREAD": "#define _LIBCPP_HAS_THREAD_API_PTHREAD 1",
+            "#cmakedefine01 _LIBCPP_HAS_THREAD_API_WIN32": "#define _LIBCPP_HAS_THREAD_API_WIN32 0",
+            "#cmakedefine01 _LIBCPP_HAS_THREAD_API_C11": "#define _LIBCPP_HAS_THREAD_API_C11 0",
+            "#cmakedefine01 _LIBCPP_HAS_THREAD_API_EXTERNAL": "#define _LIBCPP_HAS_THREAD_API_EXTERNAL 0",
+            "#cmakedefine01 _LIBCPP_HAS_TIME_ZONE_DATABASE": "#define _LIBCPP_HAS_TIME_ZONE_DATABASE 1",
+            "#cmakedefine _LIBCPP_NO_VCRUNTIME": "/* #undef _LIBCPP_NO_VCRUNTIME */",
+        },
+        "@platforms//os:macos": {
+            "#cmakedefine01 _LIBCPP_ABI_FORCE_ITANIUM": "#define _LIBCPP_ABI_FORCE_ITANIUM 0",
+            "#cmakedefine01 _LIBCPP_ABI_FORCE_MICROSOFT": "#define _LIBCPP_ABI_FORCE_MICROSOFT 0",
+            "#cmakedefine01 _LIBCPP_HAS_THREAD_API_PTHREAD": "#define _LIBCPP_HAS_THREAD_API_PTHREAD 1",
+            "#cmakedefine01 _LIBCPP_HAS_THREAD_API_WIN32": "#define _LIBCPP_HAS_THREAD_API_WIN32 0",
+            "#cmakedefine01 _LIBCPP_HAS_THREAD_API_C11": "#define _LIBCPP_HAS_THREAD_API_C11 0",
+            "#cmakedefine01 _LIBCPP_HAS_THREAD_API_EXTERNAL": "#define _LIBCPP_HAS_THREAD_API_EXTERNAL 0",
+            # macOS doesn't have the system tzdata path libcxx wants;
+            # CMake defaults this to 0 on non-Linux.
+            "#cmakedefine01 _LIBCPP_HAS_TIME_ZONE_DATABASE": "#define _LIBCPP_HAS_TIME_ZONE_DATABASE 0",
+            "#cmakedefine _LIBCPP_NO_VCRUNTIME": "/* #undef _LIBCPP_NO_VCRUNTIME */",
+        },
+        "@platforms//os:windows": {
+            "#cmakedefine01 _LIBCPP_ABI_FORCE_ITANIUM": "#define _LIBCPP_ABI_FORCE_ITANIUM 0",
+            "#cmakedefine01 _LIBCPP_ABI_FORCE_MICROSOFT": "#define _LIBCPP_ABI_FORCE_MICROSOFT 1",
+            "#cmakedefine01 _LIBCPP_HAS_THREAD_API_PTHREAD": "#define _LIBCPP_HAS_THREAD_API_PTHREAD 0",
+            "#cmakedefine01 _LIBCPP_HAS_THREAD_API_WIN32": "#define _LIBCPP_HAS_THREAD_API_WIN32 1",
+            "#cmakedefine01 _LIBCPP_HAS_THREAD_API_C11": "#define _LIBCPP_HAS_THREAD_API_C11 0",
+            "#cmakedefine01 _LIBCPP_HAS_THREAD_API_EXTERNAL": "#define _LIBCPP_HAS_THREAD_API_EXTERNAL 0",
+            "#cmakedefine01 _LIBCPP_HAS_TIME_ZONE_DATABASE": "#define _LIBCPP_HAS_TIME_ZONE_DATABASE 0",
+            # Set on Windows when not using MSVC's CRT; for clang-mingw this
+            # is correct. For clang-cl it would be undefined — that variant
+            # isn't currently supported (see header comment).
+            "#cmakedefine _LIBCPP_NO_VCRUNTIME": "#define _LIBCPP_NO_VCRUNTIME",
+        },
+        # Conservative POSIX-like defaults for an unknown OS.
+        "//conditions:default": {
+            "#cmakedefine01 _LIBCPP_ABI_FORCE_ITANIUM": "#define _LIBCPP_ABI_FORCE_ITANIUM 0",
+            "#cmakedefine01 _LIBCPP_ABI_FORCE_MICROSOFT": "#define _LIBCPP_ABI_FORCE_MICROSOFT 0",
+            "#cmakedefine01 _LIBCPP_HAS_THREAD_API_PTHREAD": "#define _LIBCPP_HAS_THREAD_API_PTHREAD 1",
+            "#cmakedefine01 _LIBCPP_HAS_THREAD_API_WIN32": "#define _LIBCPP_HAS_THREAD_API_WIN32 0",
+            "#cmakedefine01 _LIBCPP_HAS_THREAD_API_C11": "#define _LIBCPP_HAS_THREAD_API_C11 0",
+            "#cmakedefine01 _LIBCPP_HAS_THREAD_API_EXTERNAL": "#define _LIBCPP_HAS_THREAD_API_EXTERNAL 0",
+            "#cmakedefine01 _LIBCPP_HAS_TIME_ZONE_DATABASE": "#define _LIBCPP_HAS_TIME_ZONE_DATABASE 0",
+            "#cmakedefine _LIBCPP_NO_VCRUNTIME": "/* #undef _LIBCPP_NO_VCRUNTIME */",
+        },
+    }),
+    template = "include/__config_site.in",
+)
+
+# module.modulemap: substitute the single CMake variable
+# `LIBCXX_CONFIG_SITE_MODULE_ENTRY` to expose __config_site as a textual
+# header within the std_config module (matches what CMake produces).
+expand_template(
+    name = "module_modulemap_gen",
+    out = "include/module.modulemap",
+    substitutions = {
+        "@LIBCXX_CONFIG_SITE_MODULE_ENTRY@": "textual header \"__config_site\"",
+    },
+    template = "include/module.modulemap.in",
+)
+
+# __assertion_handler: copied verbatim from libcxx/vendor/llvm/. CMake uses
+# `configure_file(... COPYONLY)` for this — no substitutions. Mirrored via
+# an empty-substitution expand_template (Bazel has no native "copy a file
+# under a new name" rule that fits cleanly here without a genrule).
+expand_template(
+    name = "assertion_handler_gen",
+    out = "include/__assertion_handler",
+    substitutions = {},
+    template = "vendor/llvm/default_assertion_handler.in",
+)
+
+# ---------------------------------------------------------------------------
+# Public headers
+# ---------------------------------------------------------------------------
+
+# All libcxx headers. Globbing because the include tree has 1458+ files and
+# explicit listing would be unmaintainable. Excludes:
+#   - .in templates (substituted into the generated headers above)
+#   - CMakeLists.txt
+#   - vendor/ shouldn't be in this glob anyway (it's outside include/)
+cc_library(
+    name = "cxx_headers",
+    hdrs = glob(
+        ["include/**/*"],
+        exclude = [
+            "include/**/*.in",
+            "include/**/CMakeLists.txt",
+        ],
+    ) + [
+        "include/__assertion_handler",
+        "include/__config_site",
+        "include/module.modulemap",
+    ],
+    includes = ["include"],
+)
+
+# ---------------------------------------------------------------------------
+# libc++
+# ---------------------------------------------------------------------------
+
+# libcxx's own internal headers under src/include (Ryu fp conversion, ABI
+# adapters, refstring, sso_allocator, atomic_support, etc.) and the
+# .ipp runtime-implementation fragments under src/support/runtime that
+# specific .cpp files conditionally #include. Listed via textual_hdrs
+# because they're not self-contained.
+_libcxx_src_textual_hdrs = glob([
+    "src/include/**/*.h",
+    "src/support/runtime/*.ipp",
+    "src/filesystem/*.h",
+])
+
+# Source set. We pin every LIBCXX_ENABLE_* knob ON for the supported
+# configurations (matches __config_site above):
+#   - LIBCXX_ENABLE_THREADS            : atomic/barrier/mutex/thread/...
+#   - LIBCXX_ENABLE_RANDOM_DEVICE      : random.cpp
+#   - LIBCXX_ENABLE_LOCALIZATION       : iostream/locale/regex/...
+#   - LIBCXX_ENABLE_FILESYSTEM         : src/filesystem/*.cpp
+#   - LIBCXX_ENABLE_NEW_DELETE_DEFS    : new.cpp
+# The Windows-only support/win32/*.cpp files are select()ed in. The ZOS,
+# IBM, and Apple-specific paths in libcxx/src/CMakeLists.txt aren't ported.
+cc_library(
+    name = "cxx",
+    srcs = [
+        # Core (LIBCXX_SOURCES unconditional set)
+        "src/algorithm.cpp",
+        "src/any.cpp",
+        "src/bind.cpp",
+        "src/call_once.cpp",
+        "src/charconv.cpp",
+        "src/chrono.cpp",
+        "src/error_category.cpp",
+        "src/exception.cpp",
+        "src/expected.cpp",
+        "src/functional.cpp",
+        "src/hash.cpp",
+        "src/memory.cpp",
+        "src/memory_resource.cpp",
+        "src/new_handler.cpp",
+        "src/new_helpers.cpp",
+        "src/optional.cpp",
+        "src/print.cpp",
+        "src/random_shuffle.cpp",
+        "src/stdexcept.cpp",
+        "src/string.cpp",
+        "src/system_error.cpp",
+        "src/typeinfo.cpp",
+        "src/valarray.cpp",
+        "src/variant.cpp",
+        "src/vector.cpp",
+        "src/verbose_abort.cpp",
+        # Ryu floating-point conversion (always built)
+        "src/ryu/d2fixed.cpp",
+        "src/ryu/d2s.cpp",
+        "src/ryu/f2s.cpp",
+        # Threads (LIBCXX_ENABLE_THREADS = ON)
+        "src/atomic.cpp",
+        "src/barrier.cpp",
+        "src/condition_variable.cpp",
+        "src/condition_variable_destructor.cpp",
+        "src/future.cpp",
+        "src/mutex.cpp",
+        "src/mutex_destructor.cpp",
+        "src/shared_mutex.cpp",
+        "src/thread.cpp",
+        # Random device (LIBCXX_ENABLE_RANDOM_DEVICE = ON)
+        "src/random.cpp",
+        # Localization (LIBCXX_ENABLE_LOCALIZATION = ON)
+        "src/fstream.cpp",
+        "src/ios.cpp",
+        "src/ios.instantiations.cpp",
+        "src/iostream.cpp",
+        "src/locale.cpp",
+        "src/ostream.cpp",
+        "src/regex.cpp",
+        "src/strstream.cpp",
+        "src/text_encoding.cpp",
+        # Filesystem (LIBCXX_ENABLE_FILESYSTEM = ON)
+        "src/filesystem/directory_entry.cpp",
+        "src/filesystem/directory_iterator.cpp",
+        "src/filesystem/filesystem_clock.cpp",
+        "src/filesystem/filesystem_error.cpp",
+        "src/filesystem/int128_builtins.cpp",
+        "src/filesystem/operations.cpp",
+        "src/filesystem/path.cpp",
+        # New/delete (LIBCXX_ENABLE_NEW_DELETE_DEFINITIONS = ON)
+        "src/new.cpp",
+    ] + select({
+        # Windows-only support: locale, threading, compiler-rt shims.
+        "@platforms//os:windows": [
+            "src/support/win32/compiler_rt_shims.cpp",
+            "src/support/win32/locale_win32.cpp",
+            "src/support/win32/support.cpp",
+            "src/support/win32/thread_win32.cpp",
+        ],
+        "//conditions:default": [],
+    }),
+    # copts derived from libcxx/cmake/caches/Generic-cxx20.cmake +
+    # libcxx/CMakeLists.txt's add_compile_flags_if_supported calls.
+    #
+    # -nostdinc++ ensures our libcxx headers are picked up instead of the
+    # host toolchain's; -isystem on cxx_headers is via the `includes`
+    # attribute. This is the only way to compile libcxx's .cpp against its
+    # own headers without leaking host libstdc++.
+    copts = [
+        "-D_LIBCPP_BUILDING_LIBRARY",
+        "-D_LIBCPP_HAS_NO_VENDOR_AVAILABILITY_ANNOTATIONS",
+        # Don't include the host system C++ headers; use our own.
+        "-nostdinc++",
+        # Hidden visibility: matches what CMake's
+        # LIBCXX_ADD_HIDDEN_VISIBILITY does. Public API symbols are
+        # explicitly marked visible via _LIBCPP_EXPORTED_FROM_ABI.
+        "-fvisibility=hidden",
+        "-fvisibility-inlines-hidden",
+        # libcxx is C++23 internally; CMake sets this in
+        # set_target_properties(... CXX_STANDARD 23 ...).
+        "-std=c++23",
+        # Warning suppressions matching what libcxx/CMakeLists.txt enables.
+        # -Wno-covered-switch-default is a Clang spelling that GCC silently
+        # ignores (it warns "may have been intended to silence earlier
+        # diagnostics" but doesn't error), so it's safe in the common list.
+        "-Wno-user-defined-literals",
+        "-Wno-covered-switch-default",
+    ] + select({
+        # -fvisibility-global-new-delete=force-hidden is Clang-only;
+        # GCC errors on it (unrecognized option). Same flag list is
+        # accepted by clang-cl which uses the Clang frontend.
+        "@rules_cc//cc/compiler:clang": ["-fvisibility-global-new-delete=force-hidden"],
+        "@rules_cc//cc/compiler:clang-cl": ["-fvisibility-global-new-delete=force-hidden"],
+        "//conditions:default": [],
+    }),
+    # cc_library puts srcs' textual fragments in textual_hdrs so the
+    # layering check doesn't complain about #include "include/refstring.h"
+    # from inside src/.
+    textual_hdrs = _libcxx_src_textual_hdrs,
+    # Include path for src/include (where Ryu, refstring, etc. live). Bazel
+    # injects -iquote relative to the package root, which is correct.
+    deps = [":cxx_headers"],
+    # Symbols libcxx's runtime needs that aren't in libcxx itself:
+    #   - libc (memcpy, strerror, ...): always available, no flag needed
+    #   - pthread (on POSIX): needed for threading
+    #   - libm (math): needed for chrono / random distributions
+    #   - libdl (on POSIX): needed for filesystem dynamic loading
+    linkopts = select({
+        "@platforms//os:windows": [],
+        "//conditions:default": [
+            "-lpthread",
+            "-ldl",
+            "-lm",
+        ],
+    }),
+)
