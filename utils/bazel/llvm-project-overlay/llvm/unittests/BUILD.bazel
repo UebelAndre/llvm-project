@@ -849,6 +849,14 @@ cc_test(
         ["Target/AArch64/*.cpp"],
         allow_empty = False,
     ),
+    # SMEAttributes.Constructors uses EXPECT_DEBUG_DEATH; on Windows the death
+    # subprocess exits with 1953069125 (0x74737365) rather than an abnormal
+    # termination code gtest recognizes, so the test reports "died but not with
+    # expected exit code".
+    args = select({
+        "@platforms//os:windows": ["--gtest_filter=-SMEAttributes.Constructors"],
+        "//conditions:default": [],
+    }),
     copts = [
         "$(STACK_FRAME_UNLIMITED)",
     ],
